@@ -234,8 +234,9 @@ class AuronFunctionSuite extends AuronQueryTest with BaseAuronSQLSuite {
             |  (timestamp'1970-01-01 00:30:00', null)
             |""".stripMargin)
 
-        val df = checkSparkAnswerAndOperator("select datediff(end_ts, start_ts) from t1")
-        checkAnswer(df, Seq(Row(0), Row(1), Row(-1), Row(null), Row(null)))
+        val query = "select datediff(end_ts, start_ts) from t1"
+        checkSparkAnswerAndOperator(query)
+        checkAnswer(sql(query), Seq(Row(0), Row(1), Row(-1), Row(null), Row(null)))
       }
     }
   }
