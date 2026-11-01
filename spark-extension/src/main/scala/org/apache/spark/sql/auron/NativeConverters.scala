@@ -359,7 +359,12 @@ object NativeConverters extends Logging {
             try {
               val converted =
                 convertExprWithFallback(child, isPruningExpr = false, fallbackToError)
-              Shims.get.createNativeExprWrapper(converted, child.dataType, child.nullable)
+              child match {
+                // Preserve literal parameters only after successful conversion.
+                case literal: Literal => literal
+                case _ =>
+                  Shims.get.createNativeExprWrapper(converted, child.dataType, child.nullable)
+              }
             } catch {
               case _: NotImplementedError =>
                 val fallbacked = convertExpr(child)
@@ -1169,13 +1174,30 @@ object NativeConverters extends Logging {
           if e.dataType.isInstanceOf[FloatType] || e.dataType.isInstanceOf[DoubleType] =>
         buildExtScalarFunction("Spark_NormalizeNanAndZero", e.children, e.dataType)
 
+      case e @ (_: ArrayDistinct | _: ArrayUnion) if (e.dataType match {
+            // Spark 3.0 has different NaN deduplication behavior.
+            case ArrayType(FloatType | DoubleType, _) =>
+              SparkVersionUtil.SPARK_RUNTIME_VERSION >= "3.1"
+            case ArrayType(elementType: AtomicType, _) =>
+              isTypeSupported(elementType) || elementType == BinaryType
+            case ArrayType(NullType, _) => true
+            case _ => false
+          }) =>
+        buildExtScalarFunction(
+          if (e.isInstanceOf[ArrayUnion]) "Spark_ArrayUnion" else "Spark_ArrayDistinct",
+          e.children,
+          e.dataType)
       case e: CreateArray => buildExtScalarFunction("Spark_MakeArray", e.children, e.dataType)
       case e: ArrayContains
           if e.right.dataType.isInstanceOf[AtomicType] && isTypeSupported(e.right.dataType) =>
         buildExtScalarFunction("Spark_ArrayContains", e.children, e.dataType)
-      case e: ArraysOverlap
-          if e.left.dataType.asInstanceOf[ArrayType].elementType.isInstanceOf[AtomicType] &&
-            isTypeSupported(e.left.dataType) =>
+      case e: ArraysOverlap if isTypeSupported(e.left.dataType) && (e.left.dataType match {
+            // Spark 3.0's interpreted and code-generated paths compare floats differently.
+            case ArrayType(FloatType | DoubleType, _) =>
+              SparkVersionUtil.SPARK_RUNTIME_VERSION >= "3.1"
+            case ArrayType(_: AtomicType, _) => true
+            case _ => false
+          }) =>
         buildExtScalarFunction("Spark_ArraysOverlap", e.children, e.dataType)
       case e: Flatten => buildExtScalarFunction("Spark_ArrayFlatten", e.children, e.dataType)
       case e: MapFromEntries =>
@@ -1429,15 +1451,23 @@ object NativeConverters extends Logging {
       right: Expression,
       op: String,
       isPruningExpr: Boolean,
-      fallback: Expression => pb.PhysicalExprNode): pb.PhysicalExprNode =
+      fallback: Expression => pb.PhysicalExprNode): pb.PhysicalExprNode = {
+    // Pruning needs a direct column/literal comparison; row filters still normalize floats.
+    val normalizeFloatComparison = !isPruningExpr &&
+      (left.dataType == FloatType || left.dataType == DoubleType) &&
+      (op == "Eq" || op == "NotEq" || op == "Lt" || op == "LtEq" || op == "Gt" ||
+        op == "GtEq" || op == "IsNotDistinctFrom")
+    val lhs = if (normalizeFloatComparison) NormalizeNaNAndZero(left) else left
+    val rhs = if (normalizeFloatComparison) NormalizeNaNAndZero(right) else right
     buildExprNode {
       _.setBinaryExpr(
         pb.PhysicalBinaryExprNode
           .newBuilder()
-          .setL(convertExprWithFallback(left, isPruningExpr, fallback))
-          .setR(convertExprWithFallback(right, isPruningExpr, fallback))
+          .setL(convertExprWithFallback(lhs, isPruningExpr, fallback))
+          .setR(convertExprWithFallback(rhs, isPruningExpr, fallback))
           .setOp(op))
     }
+  }
 
   def buildScalarFunctionNode(
       fn: pb.ScalarFunction,

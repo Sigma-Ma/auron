@@ -697,23 +697,13 @@ class ShimsImpl extends Shims with Logging {
                 .setArrowType(NativeConverters.convertDataType(e.dataType)))
             .build())
 
-      case e if isFloatingPointArrayNormalization(e) =>
-        Some(
-          pb.PhysicalExprNode
-            .newBuilder()
-            .setScalarFunction(
-              pb.PhysicalScalarFunctionNode
-                .newBuilder()
-                .setFun(pb.ScalarFunction.AuronExtFunctions)
-                .setName("Spark_NormalizeNanAndZero")
-                .addArgs(NativeConverters
-                  .convertExprWithFallback(e.children.head, isPruningExpr, fallback))
-                .setReturnType(NativeConverters.convertDataType(e.dataType)))
-            .build())
-
       case e: TaggingExpression =>
         Some(NativeConverters.convertExprWithFallback(e.child, isPruningExpr, fallback))
       case e =>
+        convertFloatingArrayNormalization(e, isPruningExpr, fallback) match {
+          case Some(v) => return Some(v)
+          case None =>
+        }
         convertPromotePrecision(e, isPruningExpr, fallback) match {
           case Some(v) => return Some(v)
           case None =>
@@ -728,24 +718,38 @@ class ShimsImpl extends Shims with Logging {
 
   @sparkver("3.0 / 3.1 / 3.2 / 3.3 / 3.4 / 3.5 / 4.0 / 4.1")
   @nowarn("cat=unused")
-  private def isFloatingPointArrayNormalization(e: Expression): Boolean = false
+  private def convertFloatingArrayNormalization(
+      e: Expression,
+      isPruningExpr: Boolean,
+      fallback: Expression => pb.PhysicalExprNode): Option[pb.PhysicalExprNode] = None
 
   @sparkver("4.2")
-  private def isFloatingPointArrayNormalization(e: Expression): Boolean = {
+  private def convertFloatingArrayNormalization(
+      e: Expression,
+      isPruningExpr: Boolean,
+      fallback: Expression => pb.PhysicalExprNode): Option[pb.PhysicalExprNode] = {
     import org.apache.spark.sql.catalyst.expressions.{ArrayTransform, KnownFloatingPointNormalized, LambdaFunction, NamedLambdaVariable}
     import org.apache.spark.sql.catalyst.optimizer.NormalizeNaNAndZero
     import org.apache.spark.sql.types.{DoubleType, FloatType}
 
     e match {
       case ArrayTransform(
-            _,
+            array,
             LambdaFunction(
-              KnownFloatingPointNormalized(NormalizeNaNAndZero(variable: NamedLambdaVariable)),
+              KnownFloatingPointNormalized(NormalizeNaNAndZero(value: NamedLambdaVariable)),
               Seq(argument: NamedLambdaVariable),
-              _)) =>
-        variable.exprId == argument.exprId &&
-        (variable.dataType == FloatType || variable.dataType == DoubleType)
-      case _ => false
+              false))
+          if value.exprId == argument.exprId &&
+            (argument.dataType == FloatType || argument.dataType == DoubleType) &&
+            array.dataType == ArrayType(argument.dataType, argument.nullable) =>
+        Some(
+          NativeConverters.buildExtScalarFunctionNode(
+            "Spark_NormalizeNanAndZero",
+            array :: Nil,
+            array.dataType,
+            isPruningExpr,
+            fallback))
+      case _ => None
     }
   }
 
